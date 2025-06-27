@@ -1,0 +1,747 @@
+import os
+import time
+import random
+import threading
+import requests
+import sqlite3
+import json
+import tkinter as tk
+from tkinter import ttk, scrolledtext, filedialog, messagebox
+from PIL import Image, ImageTk
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import undetected_chromedriver as uc
+from datetime import datetime
+import webbrowser
+
+# --- CONFIG ---
+KEYWORD_DEFAULT = "Roblox"
+WEBHOOK_DEFAULT = ""
+CHECKED_DB = "checked_numbers.db"
+CHECKED_TXT = "checked_numbers.txt"
+CUSTOM_SITES_FILE = "custom_sites.json"
+CONFIG_FILE = "lunacrypt_config.json"
+DELAY_RANGE = (1.0, 2.5)
+UPDATE_URL = "https://your-update-url.com"  # Change this to your update page
+
+DEFAULT_SITES = [
+    {
+        "name": "sms24.me",
+        "base_url": "https://sms24.me/en",
+        "country_xpath": "//div[contains(@class, 'country-list')]//a",
+        "number_xpath": "//a[contains(@href, '/receive-sms/')]",
+        "sms_message_xpath": "//td[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{keyword}')]",
+        "pagination_selector": "ul.pagination li a",
+        "page_param": "?page={page}",
+        "number_href_prefix": "https://sms24.me"
+    },
+    {
+        "name": "smstome.com",
+        "base_url": "https://smstome.com/",
+        "country_xpath": "//a[contains(@href, '/country/')]",
+        "number_xpath": "//a[contains(@href, '/phone/')]",
+        "sms_message_xpath": "//td[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{keyword}')]",
+        "pagination_selector": "div.pagination a",
+        "page_param": "?page={page}",
+        "number_href_prefix": "https://smstome.com"
+    },
+    {
+        "name": "quackr.io",
+        "base_url": "https://quackr.io/temporary-phone-numbers",
+        "country_xpath": "//a[contains(@href, '/country/')]",
+        "number_xpath": "//a[contains(@href, '/number/')]",
+        "sms_message_xpath": "//td[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{keyword}')]",
+        "pagination_selector": "ul.pagination li a",
+        "page_param": "?page={page}",
+        "number_href_prefix": "https://quackr.io"
+    },
+    {
+        "name": "temporary-phone-number.com",
+        "base_url": "https://temporary-phone-number.com/",
+        "number_xpath": "//div[contains(@class, 'number-box')]//a[contains(@href, '/number/')]",
+        "sms_message_xpath": "//td[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{keyword}')]",
+        "pagination_selector": "ul.pagination li a",
+        "page_param": "?page={page}",
+        "number_href_prefix": "https://temporary-phone-number.com"
+    },
+]
+
+def load_custom_sites():
+    if not os.path.exists(CUSTOM_SITES_FILE):
+        return []
+    try:
+        with open(CUSTOM_SITES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_custom_sites(sites):
+    with open(CUSTOM_SITES_FILE, "w", encoding="utf-8") as f:
+        json.dump(sites, f, indent=2)
+
+def db_setup():
+    with sqlite3.connect(CHECKED_DB) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS checked (site TEXT, number TEXT, PRIMARY KEY(site, number))")
+
+def db_is_checked(site, number):
+    with sqlite3.connect(CHECKED_DB) as db:
+        cur = db.execute("SELECT 1 FROM checked WHERE site=? AND number=?", (site, number))
+        return cur.fetchone() is not None
+
+def db_mark_checked(site, number):
+    with sqlite3.connect(CHECKED_DB) as db:
+        db.execute("INSERT OR IGNORE INTO checked (site, number) VALUES (?, ?)", (site, number))
+        db.commit()
+
+def load_checked_txt():
+    if not os.path.exists(CHECKED_TXT):
+        return set()
+    with open(CHECKED_TXT, "r", encoding="utf-8") as f:
+        return set(tuple(line.strip().split(",", 1)) for line in f if line.strip())
+
+def save_checked_txt(site, number):
+    with open(CHECKED_TXT, "a", encoding="utf-8") as f:
+        f.write(f"{site},{number}\n")
+
+def send_discord(webhook, number, msg, link, site, keyword, ping=False):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    content = f"Keyword '{keyword}' found!\nNumber: {number}\nMessage: {msg}\nView SMS: {link}\nSource: {site}\nDateTime: {now}"
+    data = {
+        "content": "@everyone" if ping else content,
+        "embeds": [{
+            "title": f"Keyword '{keyword}' found!",
+            "description": content,
+            "color": 0x800080,
+        }]
+    }
+    try:
+        resp = requests.post(webhook, json=data)
+        if resp.status_code not in (200, 204):
+            print(f"[Discord] Failed to send webhook: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"[Discord] Exception sending webhook: {e}")
+
+def wait_for_captcha_bypass(driver, log, root, timeout=60):
+    log("[INFO] Checking for CAPTCHA...")
+    start = time.time()
+    while time.time() - start < timeout:
+        if "captcha" not in driver.current_url.lower() and "captcha" not in driver.page_source.lower():
+            log("[INFO] CAPTCHA not detected or bypassed.")
+            return True
+        if not hasattr(wait_for_captcha_bypass, "prompt_shown"):
+            wait_for_captcha_bypass.prompt_shown = True
+            def on_continue():
+                wait_for_captcha_bypass.manual_solve_done = True
+                prompt.destroy()
+            wait_for_captcha_bypass.manual_solve_done = False
+            prompt = tk.Toplevel(root)
+            prompt.title("CAPTCHA Detected")
+            prompt.geometry("400x150")
+            prompt.configure(bg="#181824")
+            tk.Label(prompt, text="CAPTCHA detected!\nPlease solve it manually in the browser window.\nClick Continue when done.", fg="#00fff7", bg="#181824", font=("Consolas", 12)).pack(pady=20)
+            ttk.Button(prompt, text="Continue", command=on_continue).pack()
+            prompt.transient(root)
+            prompt.grab_set()
+            root.wait_window(prompt)
+        if getattr(wait_for_captcha_bypass, "manual_solve_done", False):
+            log("[INFO] User confirmed CAPTCHA solved.")
+            wait_for_captcha_bypass.prompt_shown = False
+            return True
+        time.sleep(3)
+    log("[WARN] CAPTCHA not bypassed within timeout.")
+    wait_for_captcha_bypass.prompt_shown = False
+    return False
+
+def get_total_pages(driver, selector):
+    try:
+        pagination = driver.find_elements(By.CSS_SELECTOR, selector)
+        page_numbers = [btn.text.strip() for btn in pagination if btn.text.strip().isdigit()]
+        if page_numbers:
+            return int(page_numbers[-1])
+    except Exception:
+        pass
+    return 1
+
+def random_delay():
+    time.sleep(random.uniform(*DELAY_RANGE))
+
+def get_random_user_agent():
+    return random.choice([
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    ])
+
+def random_viewport():
+    return (random.randint(800, 1920), random.randint(600, 1080))
+
+def is_valid_number(text):
+    return text and any(char.isdigit() for char in text) and (("+" in text and len(text) > 7) or len(text) > 8)
+
+def scrape_numbers_on_page(driver, site, checked_numbers_db, checked_numbers_txt, keyword, webhook, ping, log, stop_flag, progress_callback):
+    nidx = 0
+    wait = WebDriverWait(driver, 15)
+    while not stop_flag[0]:
+        try:
+            wait.until(EC.visibility_of_all_elements_located((By.XPATH, site.get("number_xpath", "//a"))))
+            numbers = driver.find_elements(By.XPATH, site.get("number_xpath", "//a"))
+        except Exception as e:
+            log(f"[ERROR] Waiting for numbers failed: {e}")
+            driver.save_screenshot(f"screenshot_{site['name']}_numbers.png")
+            break
+
+        if nidx >= len(numbers):
+            break
+        n = numbers[nidx]
+        number_text = n.text.strip()
+        if not is_valid_number(number_text):
+            nidx += 1
+            continue
+        number_href = n.get_attribute('href')
+        if not number_href:
+            nidx += 1
+            continue
+
+        if db_is_checked(site['name'], number_text) or (site['name'], number_text) in checked_numbers_txt:
+            nidx += 1
+            continue
+
+        if number_href and not number_href.startswith("http"):
+            number_href = site.get("number_href_prefix", site.get("base_url", "")) + number_href
+        log(f"  [CORE] {number_text}: {number_href}")
+
+        try:
+            driver.get(number_href)
+            if not wait_for_captcha_bypass(driver, log, progress_callback.root):
+                log("[WARN] Skipping number due to CAPTCHA.")
+                nidx += 1
+                continue
+
+            random_delay()
+            total_sms_pages = get_total_pages(driver, site.get("pagination_selector", "ul.pagination li a"))
+            found_any = False
+            sent_messages = set()
+
+            for sms_page in range(1, total_sms_pages + 1):
+                if sms_page > 1:
+                    driver.get(f"{number_href}{site.get('page_param', '?page={page}').format(page=sms_page)}")
+                    if not wait_for_captcha_bypass(driver, log, progress_callback.root):
+                        log("[WARN] Skipping page due to CAPTCHA.")
+                        break
+                    random_delay()
+                try:
+                    sms_xpath = site.get("sms_message_xpath", "//td[contains(., '{keyword}')]").replace("{keyword}", keyword.lower())
+                    wait.until(EC.visibility_of_all_elements_located((By.XPATH, sms_xpath)))
+                    messages = driver.find_elements(By.XPATH, sms_xpath)
+                except Exception:
+                    messages = []
+
+                for m in messages:
+                    msg_text = m.text.strip()
+                    if msg_text in sent_messages:
+                        continue
+                    sent_messages.add(msg_text)
+                    log(f"    [FOUND] {number_text} page {sms_page}: {msg_text[:60]}")
+                    send_discord(webhook, number_text, msg_text, f"{number_href}{site.get('page_param', '?page={page}').format(page=sms_page)}", site['name'], keyword, ping)
+                    found_any = True
+
+            if not found_any:
+                log(f"    [NO '{keyword}'] {number_text}")
+
+            db_mark_checked(site['name'], number_text)
+            save_checked_txt(site['name'], number_text)
+
+            driver.back()
+            random_delay()
+        except Exception as e:
+            log(f"[ERROR] Scraping number {number_text}: {e}")
+            driver.save_screenshot(f"screenshot_{site['name']}_error.png")
+        nidx += 1
+        progress_callback.update_progress(nidx)
+
+def scrape_site(driver, site, keyword, webhook, ping, log, stop_flag, progress_callback):
+    log(f"\n========== STARTING SITE: {site['name']} ==========")
+    driver.get(site["base_url"])
+    if not wait_for_captcha_bypass(driver, log, progress_callback.root):
+        log("[WARN] CAPTCHA detected on base site, skipping site.")
+        return
+    random_delay()
+    checked_numbers_txt = load_checked_txt()
+    checked_numbers_db = set()
+
+    wait = WebDriverWait(driver, 15)
+    if "country_xpath" in site and site["country_xpath"]:
+        cidx = 0
+        while not stop_flag[0]:
+            try:
+                wait.until(EC.visibility_of_all_elements_located((By.XPATH, site["country_xpath"])))
+                countries = driver.find_elements(By.XPATH, site["country_xpath"])
+            except Exception as e:
+                log(f"[ERROR] Waiting for countries failed: {e}")
+                driver.save_screenshot(f"screenshot_{site['name']}_countries.png")
+                break
+            if cidx >= len(countries):
+                break
+            c = countries[cidx]
+            country_name = c.text.strip()
+            country_href = c.get_attribute('href')
+            if country_href and not country_href.startswith("http"):
+                country_href = site.get("number_href_prefix", site.get("base_url", "")) + country_href
+            log(f"[OUTER CORE] {country_name}: {country_href}")
+            try:
+                driver.get(country_href)
+                if not wait_for_captcha_bypass(driver, log, progress_callback.root):
+                    log("[WARN] CAPTCHA detected on country page, skipping country.")
+                    cidx += 1
+                    continue
+                random_delay()
+                scrape_numbers_on_page(driver, site, checked_numbers_db, checked_numbers_txt, keyword, webhook, ping, log, stop_flag, progress_callback)
+                driver.get(site["base_url"])
+                if not wait_for_captcha_bypass(driver, log, progress_callback.root):
+                    log("[WARN] CAPTCHA detected on base site, stopping site scrape.")
+                    break
+                random_delay()
+            except Exception as e:
+                log(f"[ERROR] Scraping country {country_name}: {e}")
+                driver.save_screenshot(f"screenshot_{site['name']}_country_error.png")
+            cidx += 1
+    else:
+        scrape_numbers_on_page(driver, site, checked_numbers_db, checked_numbers_txt, keyword, webhook, ping, log, stop_flag, progress_callback)
+    log(f"========== FINISHED SITE: {site['name']} ==========")
+
+def scraper_thread(selected_sites, keyword, webhook, ping, headless, log, stop_flag, all_sites, progress_callback, chromedriver_path, set_status):
+    db_setup()
+    total_sites = len(selected_sites)
+    for idx, site in enumerate(all_sites):
+        if site['name'] not in selected_sites:
+            continue
+        if stop_flag[0]:
+            break
+        try:
+            set_status(f"Scraping {site['name']} ({idx+1}/{total_sites})...")
+            options = uc.ChromeOptions()
+            if headless:
+                options.headless = True
+            options.add_argument(f"user-agent={get_random_user_agent()}")
+            width, height = random_viewport()
+            options.add_argument(f"--window-size={width},{height}")
+            driver = uc.Chrome(options=options, executable_path=chromedriver_path)
+            log(f"[INFO] Starting scrape for site {site['name']} ({idx+1}/{total_sites})")
+            progress_callback.set_max_progress(100)
+            scrape_site(driver, site, keyword, webhook, ping, log, stop_flag, progress_callback)
+            driver.quit()
+        except Exception as e:
+            log(f"[ERROR] {site['name']}: {e}")
+    progress_callback.set_max_progress(0)
+    set_status("Done.")
+    log("[INFO] Scraping finished.")
+
+class ManageSitesWindow(tk.Toplevel):
+    def __init__(self, parent, sites, on_save, dark_mode, chromedriver_path):
+        super().__init__(parent)
+        self.title("Manage Custom Sites")
+        self.geometry("850x500")
+        self.configure(bg="#181824" if dark_mode else "#f0f0f0")
+        self.sites = sites
+        self.on_save = on_save
+        self.dark_mode = dark_mode
+        self.chromedriver_path = chromedriver_path
+
+        self.listbox = tk.Listbox(self, width=40, bg="#222233" if dark_mode else "white", fg="#00fff7" if dark_mode else "black")
+        self.listbox.pack(side="left", fill="y", padx=5, pady=5)
+        self.listbox.bind("<<ListboxSelect>>", self.on_select)
+
+        self.refresh_listbox()
+
+        form_frame = tk.Frame(self, bg=self["bg"])
+        form_frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+
+        self.entries = {}
+        fields = ["name", "base_url", "country_xpath", "number_xpath", "sms_message_xpath",
+                  "pagination_selector", "page_param", "number_href_prefix"]
+        for i, field in enumerate(fields):
+            lbl = tk.Label(form_frame, text=field, bg=self["bg"], fg="#00fff7" if dark_mode else "black")
+            lbl.grid(row=i, column=0, sticky="w", pady=2)
+            ent = tk.Entry(form_frame, width=70, bg="#222233" if dark_mode else "white", fg="#00fff7" if dark_mode else "black")
+            ent.grid(row=i, column=1, sticky="ew", pady=2)
+            self.entries[field] = ent
+
+        btn_frame = tk.Frame(form_frame, bg=self["bg"])
+        btn_frame.grid(row=len(fields), column=0, columnspan=2, pady=10)
+
+        ttk.Button(btn_frame, text="Add New", command=self.add_new).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Update Selected", command=self.update_selected).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Remove Selected", command=self.remove_selected).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Test Selected", command=self.test_selected).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Save & Close", command=self.save_and_close).pack(side="left", padx=5)
+
+    def refresh_listbox(self):
+        self.listbox.delete(0, "end")
+        for site in self.sites:
+            self.listbox.insert("end", site.get("name", "Unnamed"))
+
+    def on_select(self, event):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        site = self.sites[sel[0]]
+        for key, ent in self.entries.items():
+            ent.delete(0, "end")
+            val = site.get(key, "")
+            ent.insert(0, val)
+
+    def add_new(self):
+        new_site = {key: ent.get() for key, ent in self.entries.items()}
+        if not new_site.get("name") or not new_site.get("base_url"):
+            messagebox.showerror("Error", "Name and Base URL are required")
+            return
+        self.sites.append(new_site)
+        self.refresh_listbox()
+
+    def update_selected(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            messagebox.showerror("Error", "Select a site to update")
+            return
+        idx = sel[0]
+        updated_site = {key: ent.get() for key, ent in self.entries.items()}
+        if not updated_site.get("name") or not updated_site.get("base_url"):
+            messagebox.showerror("Error", "Name and Base URL are required")
+            return
+        self.sites[idx] = updated_site
+        self.refresh_listbox()
+
+    def remove_selected(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            messagebox.showerror("Error", "Select a site to remove")
+            return
+        idx = sel[0]
+        del self.sites[idx]
+        self.refresh_listbox()
+        for ent in self.entries.values():
+            ent.delete(0, "end")
+
+    def test_selected(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            messagebox.showerror("Error", "Select a site to test")
+            return
+        site = self.sites[sel[0]]
+        try:
+            import undetected_chromedriver as uc
+            options = uc.ChromeOptions()
+            driver = uc.Chrome(options=options, executable_path=self.chromedriver_path)
+            driver.get(site.get("base_url", ""))
+            time.sleep(2)
+            numbers = driver.find_elements(By.XPATH, site.get("number_xpath", "//a"))
+            driver.quit()
+            if numbers:
+                messagebox.showinfo("Test Result", f"Found {len(numbers)} numbers on the page.")
+            else:
+                messagebox.showwarning("Test Result", "No numbers found. Check your XPath.")
+        except Exception as e:
+            messagebox.showerror("Test Error", str(e))
+
+    def save_and_close(self):
+        self.on_save(self.sites)
+        self.destroy()
+
+class ProgressCallback:
+    def __init__(self, progressbar, root):
+        self.progressbar = progressbar
+        self.root = root
+        self.max_progress = 100
+
+    def set_max_progress(self, max_val):
+        self.max_progress = max_val
+        self.progressbar['maximum'] = max_val
+        self.progressbar['value'] = 0
+        self.root.update_idletasks()
+
+    def update_progress(self, val):
+        if val > self.max_progress:
+            val = self.max_progress
+        self.progressbar['value'] = val
+        self.root.update_idletasks()
+
+class LunaCryptGUI:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("LunaCrypt")
+        self.root.configure(bg="#181824")
+        self.root.geometry("1100x800")
+        self.root.state('zoomed')
+
+        try:
+            self.root.iconphoto(False, tk.PhotoImage(file="LunaCrypt.png"))
+        except Exception as e:
+            print("Failed to load window icon:", e)
+
+        self.config = self.load_config()
+        self.custom_sites = load_custom_sites()
+        self.all_sites = DEFAULT_SITES + self.custom_sites
+        self.dark_mode = True
+        self.style = ttk.Style()
+        self.set_theme()
+
+        self.top_frame = tk.Frame(self.root, bg=self.get_bg())
+        self.top_frame.pack(side="top", fill="x", padx=10, pady=5)
+
+        self.middle_frame = tk.Frame(self.root, bg=self.get_bg())
+        self.middle_frame.pack(side="top", fill="both", expand=True, padx=10, pady=5)
+
+        self.bottom_frame = tk.Frame(self.root, bg=self.get_bg())
+        self.bottom_frame.pack(side="bottom", fill="x", padx=10, pady=5)
+
+        try:
+            logo_img = Image.open("LunaCrypt.png").resize((48, 48))
+            self.logo = ImageTk.PhotoImage(logo_img)
+            logo_label = tk.Label(self.top_frame, image=self.logo, bg=self.get_bg())
+            logo_label.pack(side="left", anchor="nw")
+        except Exception as e:
+            print("Logo load error:", e)
+
+        self.update_btn = ttk.Button(self.top_frame, text="Check for Update", command=self.open_update_url)
+        self.update_btn.pack(side="right")
+
+        self.mode_btn = ttk.Button(self.top_frame, text="Light Mode", command=self.toggle_mode)
+        self.mode_btn.pack(side="right", padx=10)
+
+        self.log_text = scrolledtext.ScrolledText(
+            self.middle_frame, state='disabled', bg=self.get_bg(), fg=self.get_fg(),
+            insertbackground=self.get_fg(), font=("Consolas", 11, "bold")
+        )
+        self.log_text.pack(fill="both", expand=True)
+
+        self.progressbar = ttk.Progressbar(self.bottom_frame, orient="horizontal", mode="determinate", length=600)
+        self.progressbar.pack(side="top", pady=5)
+        self.set_progressbar_style()
+
+        controls_frame = tk.Frame(self.bottom_frame, bg=self.get_bg())
+        controls_frame.pack(side="top", fill="x")
+
+        tk.Label(controls_frame, text="Keyword:", bg=self.get_bg(), fg=self.get_fg(), font=("Consolas", 11, "bold")).grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        self.keyword_var = tk.StringVar(value=self.config.get("keyword", KEYWORD_DEFAULT))
+        ttk.Entry(controls_frame, textvariable=self.keyword_var, width=20).grid(row=0, column=1, sticky="w", padx=5, pady=2)
+
+        tk.Label(controls_frame, text="Discord Webhook:", bg=self.get_bg(), fg=self.get_fg(), font=("Consolas", 11, "bold")).grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        self.webhook_var = tk.StringVar(value=self.config.get("webhook", WEBHOOK_DEFAULT))
+        ttk.Entry(controls_frame, textvariable=self.webhook_var, width=60).grid(row=1, column=1, columnspan=3, sticky="ew", padx=5, pady=2)
+
+        self.chromedriver_path_var = tk.StringVar(value=self.config.get("chromedriver_path", ""))
+        tk.Label(controls_frame, text="Chromedriver Path:", bg=self.get_bg(), fg=self.get_fg(), font=("Consolas", 11, "bold")).grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        ttk.Entry(controls_frame, textvariable=self.chromedriver_path_var, width=60).grid(row=2, column=1, columnspan=2, sticky="ew", padx=5, pady=2)
+        ttk.Button(controls_frame, text="Browse", command=self.browse_chromedriver).grid(row=2, column=3, sticky="w", padx=5, pady=2)
+
+        self.headless_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls_frame, text="Headless", variable=self.headless_var).grid(row=0, column=2, sticky="w", padx=5, pady=2)
+
+        self.ping_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls_frame, text="@everyone ping", variable=self.ping_var).grid(row=0, column=3, sticky="w", padx=5, pady=2)
+
+        # Scrollable sites list
+        sites_frame = tk.LabelFrame(self.bottom_frame, text="Sites", bg=self.get_bg(), fg=self.get_fg(), font=("Consolas", 11, "bold"))
+        sites_frame.pack(side="top", fill="x", pady=5, padx=5)
+        sites_canvas = tk.Canvas(sites_frame, bg=self.get_bg(), highlightthickness=0, height=50)
+        sites_scroll = ttk.Scrollbar(sites_frame, orient="horizontal", command=sites_canvas.xview)
+        sites_inner = tk.Frame(sites_canvas, bg=self.get_bg())
+        sites_inner.bind("<Configure>", lambda e: sites_canvas.configure(scrollregion=sites_canvas.bbox("all")))
+        sites_canvas.create_window((0,0), window=sites_inner, anchor="nw")
+        sites_canvas.configure(xscrollcommand=sites_scroll.set)
+        sites_canvas.pack(side="top", fill="x", expand=True)
+        sites_scroll.pack(side="bottom", fill="x")
+
+        self.site_vars = {}
+        for idx, site in enumerate(self.all_sites):
+            var = tk.BooleanVar(value=site['name'] in self.config.get("selected_sites", [s['name'] for s in self.all_sites]))
+            cb = ttk.Checkbutton(sites_inner, text=site['name'], variable=var)
+            cb.grid(row=0, column=idx, sticky="w", padx=5)
+            self.site_vars[site['name']] = var
+
+        btn_frame = tk.Frame(self.bottom_frame, bg=self.get_bg())
+        btn_frame.pack(side="top", fill="x", pady=5)
+
+        ttk.Button(btn_frame, text="Start", command=self.start_scraper).pack(side="left", expand=True, fill="x", padx=5)
+        ttk.Button(btn_frame, text="Stop", command=self.stop_scraper).pack(side="left", expand=True, fill="x", padx=5)
+        ttk.Button(btn_frame, text="Export CSV", command=self.export_csv).pack(side="left", expand=True, fill="x", padx=5)
+        ttk.Button(btn_frame, text="Manage Sites", command=self.open_manage_sites).pack(side="left", expand=True, fill="x", padx=5)
+        ttk.Button(btn_frame, text="Reset to Defaults", command=self.reset_defaults).pack(side="left", expand=True, fill="x", padx=5)
+
+        self.status_var = tk.StringVar(value="Ready")
+        self.status_bar = tk.Label(self.root, textvariable=self.status_var, anchor="w", bg=self.get_bg(), fg=self.get_fg())
+        self.status_bar.pack(side="bottom", fill="x")
+
+        self.stop_flag = [False]
+        self.scraper_thread = None
+        self.progress_callback = ProgressCallback(self.progressbar, self.root)
+
+    def get_bg(self):
+        return "#181824" if self.dark_mode else "white"
+
+    def get_fg(self):
+        return "#00fff7" if self.dark_mode else "black"
+
+    def set_theme(self):
+        if self.dark_mode:
+            self.style.theme_use('clam')
+            self.style.configure("TLabel", background="#181824", foreground="#00fff7", font=("Consolas", 11, "bold"))
+            self.style.configure("TButton", background="#181824", foreground="#00fff7", font=("Consolas", 11, "bold"))
+            self.style.configure("TCheckbutton", background="#181824", foreground="#00fff7", font=("Consolas", 11, "bold"))
+            self.style.configure("TEntry", fieldbackground="#181824", foreground="#00fff7")
+            self.style.configure("Horizontal.TProgressbar", troughcolor="#222233", background="#800080")
+        else:
+            self.style.theme_use('default')
+            self.style.configure("TLabel", background="white", foreground="black", font=("Consolas", 11, "bold"))
+            self.style.configure("TButton", background="white", foreground="black", font=("Consolas", 11, "bold"))
+            self.style.configure("TCheckbutton", background="white", foreground="black", font=("Consolas", 11, "bold"))
+            self.style.configure("TEntry", fieldbackground="white", foreground="black")
+            self.style.configure("Horizontal.TProgressbar", troughcolor="#ddd", background="#800080")
+
+    def set_progressbar_style(self):
+        self.style.configure("Horizontal.TProgressbar", background="#800080")
+
+    def toggle_mode(self):
+        self.dark_mode = not self.dark_mode
+        self.set_theme()
+        self.root.configure(bg=self.get_bg())
+        self.top_frame.configure(bg=self.get_bg())
+        self.middle_frame.configure(bg=self.get_bg())
+        self.bottom_frame.configure(bg=self.get_bg())
+        self.log_text.configure(bg=self.get_bg(), fg=self.get_fg(), insertbackground=self.get_fg())
+        self.status_bar.configure(bg=self.get_bg(), fg=self.get_fg())
+        self.mode_btn.config(text="Dark Mode" if not self.dark_mode else "Light Mode")
+
+    def open_update_url(self):
+        webbrowser.open(UPDATE_URL)
+
+    def log(self, msg):
+        self.log_text['state'] = 'normal'
+        self.log_text.insert('end', msg + "\n")
+        self.log_text.see('end')
+        self.log_text['state'] = 'disabled'
+
+    def set_status(self, msg):
+        self.status_var.set(msg)
+        self.root.update_idletasks()
+
+    def browse_chromedriver(self):
+        path = filedialog.askopenfilename(title="Select Chromedriver", filetypes=[("Chromedriver", "chromedriver.exe" if os.name == "nt" else "chromedriver")])
+        if path:
+            self.chromedriver_path_var.set(path)
+
+    def start_scraper(self):
+        if self.scraper_thread and self.scraper_thread.is_alive():
+            self.log("[WARN] Scraper already running.")
+            return
+        self.stop_flag[0] = False
+        selected_sites = [name for name, var in self.site_vars.items() if var.get()]
+        if not selected_sites:
+            messagebox.showerror("Error", "Select at least one site to scrape.")
+            return
+        keyword = self.keyword_var.get().strip()
+        if not keyword:
+            messagebox.showerror("Error", "Keyword cannot be empty.")
+            return
+        webhook = self.webhook_var.get().strip()
+        if webhook and not webhook.startswith("http"):
+            messagebox.showerror("Error", "Invalid Discord webhook URL.")
+            return
+        chromedriver_path = self.chromedriver_path_var.get().strip()
+        if not os.path.exists(chromedriver_path):
+            messagebox.showerror("Error", "Please select a valid chromedriver path.")
+            return
+        ping = self.ping_var.get()
+        headless = self.headless_var.get()
+        self.save_config()
+        self.scraper_thread = threading.Thread(
+            target=scraper_thread,
+            args=(selected_sites, keyword, webhook, ping, headless, self.log, self.stop_flag, self.all_sites, self.progress_callback, chromedriver_path, self.set_status),
+            daemon=True
+        )
+        self.scraper_thread.start()
+        self.set_status("Scraping started.")
+        self.log("[INFO] Scraper started.")
+
+    def stop_scraper(self):
+        if not self.scraper_thread or not self.scraper_thread.is_alive():
+            self.log("[WARN] Scraper is not running.")
+            return
+        self.stop_flag[0] = True
+        self.set_status("Stopping...")
+        self.log("[INFO] Scraper stop requested.")
+
+    def export_csv(self):
+        with sqlite3.connect(CHECKED_DB) as db:
+            cur = db.execute("SELECT site, number FROM checked")
+            rows = cur.fetchall()
+        file = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if file:
+            with open(file, "w", encoding="utf-8") as f:
+                f.write("site,number\n")
+                for row in rows:
+                    f.write(f"{row[0]},{row[1]}\n")
+            self.log(f"[INFO] Exported {len(rows)} rows to {file}")
+
+    def open_manage_sites(self):
+        def on_save(new_sites):
+            self.custom_sites = new_sites
+            save_custom_sites(self.custom_sites)
+            self.all_sites = DEFAULT_SITES + self.custom_sites
+            for widget in self.bottom_frame.pack_slaves():
+                if isinstance(widget, tk.LabelFrame) and widget.cget("text") == "Sites":
+                    widget.destroy()
+            sites_frame = tk.LabelFrame(self.bottom_frame, text="Sites", bg=self.get_bg(), fg=self.get_fg(), font=("Consolas", 11, "bold"))
+            sites_frame.pack(side="top", fill="x", pady=5, padx=5)
+            sites_canvas = tk.Canvas(sites_frame, bg=self.get_bg(), highlightthickness=0, height=50)
+            sites_scroll = ttk.Scrollbar(sites_frame, orient="horizontal", command=sites_canvas.xview)
+            sites_inner = tk.Frame(sites_canvas, bg=self.get_bg())
+            sites_inner.bind("<Configure>", lambda e: sites_canvas.configure(scrollregion=sites_canvas.bbox("all")))
+            sites_canvas.create_window((0,0), window=sites_inner, anchor="nw")
+            sites_canvas.configure(xscrollcommand=sites_scroll.set)
+            sites_canvas.pack(side="top", fill="x", expand=True)
+            sites_scroll.pack(side="bottom", fill="x")
+            self.site_vars = {}
+            for idx, site in enumerate(self.all_sites):
+                var = tk.BooleanVar(value=True)
+                cb = ttk.Checkbutton(sites_inner, text=site['name'], variable=var)
+                cb.grid(row=0, column=idx, sticky="w", padx=5)
+                self.site_vars[site['name']] = var
+            self.log("[INFO] Custom sites saved. Please restart the app to apply changes.")
+
+        ManageSitesWindow(self.root, self.custom_sites.copy(), on_save, self.dark_mode, self.chromedriver_path_var.get())
+
+    def reset_defaults(self):
+        if messagebox.askyesno("Reset", "Reset all settings to defaults?"):
+            if os.path.exists(CONFIG_FILE):
+                os.remove(CONFIG_FILE)
+            self.keyword_var.set(KEYWORD_DEFAULT)
+            self.webhook_var.set(WEBHOOK_DEFAULT)
+            self.chromedriver_path_var.set("")
+            for var in self.site_vars.values():
+                var.set(True)
+            self.log("[INFO] Settings reset to defaults.")
+
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        return {}
+
+    def save_config(self):
+        config = {
+            "chromedriver_path": self.chromedriver_path_var.get(),
+            "webhook": self.webhook_var.get(),
+            "keyword": self.keyword_var.get(),
+            "selected_sites": [name for name, var in self.site_vars.items() if var.get()],
+        }
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f)
+
+    def run(self):
+        self.root.mainloop()
+
+if __name__ == "__main__":
+    app = LunaCryptGUI()
+    app.run()
